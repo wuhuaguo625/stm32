@@ -1,0 +1,310 @@
+#include "stm32f10x.h"
+#include "system.h"
+#include "OLED.h"
+#include "Key.h"
+#include "Delay.h"
+
+// ================= 硬件定义 =================
+#define LED1_PORT GPIOA
+#define LED1_PIN  GPIO_Pin_1   
+#define LED2_PORT GPIOA
+#define LED2_PIN  GPIO_Pin_2   
+
+// ================= 页面状态定义 =================
+typedef enum {
+    PAGE_LOCK = 0,      // 界面一：密码锁
+    PAGE_LED_CTRL = 1,  // 界面二：LED控制
+    PAGE_SERVO = 2      // 界面三：舵机控制
+} Page_t;
+Page_t current_page = PAGE_LOCK;
+
+// ================= 密码锁参数 =================
+#define PWD_LEN 4
+const uint8_t Master_Pwd[PWD_LEN] = {1, 2, 3, 4};
+uint8_t Input_Pwd[PWD_LEN] = {0};
+uint8_t Input_Index = 0;
+uint8_t Current_Num = 0;
+uint8_t Lock_State = 0;
+
+// ================= 界面二：LED控制参数 =================
+uint8_t Led_Mode = 0;          
+uint32_t Led_Blink_Timer = 0;  
+uint8_t Led_Blink_State = 0;   
+
+// ================= 界面三：舵机控制参数 =================
+uint16_t Servo_Angle = 90;     // 初始角度 90°
+
+// LED 初始化
+void My_LED_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Pin = LED1_PIN | LED2_PIN;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    GPIO_SetBits(GPIOA, LED1_PIN | LED2_PIN); // 低电平点亮，默认高电平熄灭
+}
+
+// ================= 界面三：舵机驱动函数 =================
+// 舵机初始化 (PA8 - TIM1_CH1)
+void Servo_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_TIM1, ENABLE);
+    
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP; // 复用推挽输出
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+    TIM_OCInitTypeDef TIM_OCInitStructure;
+    
+    // 72MHz 主频。预分频 72-1 = 1MHz 计数频率 (1us 分辨率)
+    // 周期 20000-1 = 20ms (50Hz)
+    TIM_TimeBaseStructure.TIM_Period = 20000 - 1;
+    TIM_TimeBaseStructure.TIM_Prescaler = 72 - 1;
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
+    
+    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
+    TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
+    TIM_OCInitStructure.TIM_Pulse = 1500; // 初始 1.5ms -> 90度
+    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
+    TIM_OC1Init(TIM1, &TIM_OCInitStructure);
+    
+    TIM_CtrlPWMOutputs(TIM1, ENABLE); // 开启 TIM1 的 PWM 输出
+    TIM_Cmd(TIM1, ENABLE);
+}
+
+// 设置舵机角度 (0~180度)
+void Servo_SetAngle(uint16_t Angle)
+{
+    if (Angle > 180) Angle = 180;
+    if (Angle < 0) Angle = 0;
+    Servo_Angle = Angle;
+    // 0.5ms(500) ~ 2.5ms(2500)，映射 0~180 度
+    uint16_t Pulse = 500 + (Angle * 2000) / 180;
+    TIM_SetCompare1(TIM1, Pulse);
+}
+
+// ================= 界面三：EC11 旋转编码器扫描 =================
+// 返回值: 0-无动作, 1-顺时针(角度+), -1-逆时针(角度-)
+int8_t Encoder_Scan(void)
+{
+    // 静态变量保存上一次状态
+    static uint8_t last_state = 0;
+    uint8_t current_state = 0;
+    
+    // 读取 PA6(EC11_A), PA7(EC11_B) 电平
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;
+    
+    // 状态变化检测（简单消抖）
+    if (current_state != last_state)
+    {
+        Delay_us(100); // 微秒级消抖，不卡主循环（100us 极短，无感）
+        // 重新读取
+        current_state = 0;
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;
+        
+        if (current_state != last_state)
+        {
+            // 判断方向：A相变化时，B相的状态决定正反
+            if (last_state == 0x00 && current_state == 0x01) // A上升沿，B为低
+            {
+                last_state = current_state;
+                return -1; // 逆时针，减少
+            }
+            else if (last_state == 0x00 && current_state == 0x02) // B上升沿，A为低
+            {
+                last_state = current_state;
+                return 1; // 顺时针，增加
+            }
+            // 其他状态翻转模式（比如 01 -> 00）
+            else if (last_state == 0x01 && current_state == 0x00) 
+            {
+                last_state = current_state;
+                return 1; 
+            }
+            else if (last_state == 0x02 && current_state == 0x00) 
+            {
+                last_state = current_state;
+                return -1; 
+            }
+            else
+            {
+                last_state = current_state;
+            }
+        }
+    }
+    return 0;
+}
+
+// ================= 界面刷新函数 =================
+void UI_Lock_Refresh(void)
+{
+    OLED_Clear();
+    if (Lock_State == 0) 
+    {
+        OLED_ShowString(1, 1, "Input Password:");
+        for (uint8_t i = 0; i < Input_Index; i++) {
+            OLED_ShowChar(2, 1 + i * 2, '*');
+        }
+        if (Input_Index < PWD_LEN) {
+            OLED_ShowNum(2, 1 + Input_Index * 2, Current_Num, 1);
+        }
+        OLED_ShowString(4, 1, "K1:Num K2:OK");
+        OLED_ShowString(4, 13, "K3:Del");
+    }
+}
+
+void UI_Led_Ctrl_Refresh(void)
+{
+    OLED_Clear();
+    OLED_ShowString(1, 1, "  LED Control  ");
+    OLED_ShowString(2, 1, "Mode: ");
+    if (Led_Mode == 0) OLED_ShowString(2, 7, "1 - Always ON ");
+    else if (Led_Mode == 1) OLED_ShowString(2, 7, "2 - Always OFF");
+    else if (Led_Mode == 2) OLED_ShowString(2, 7, "3 - Blinking  ");
+    OLED_ShowString(4, 1, "K1:Mode K2:Next");
+    OLED_ShowString(4, 13, "K3:Lock");
+}
+
+void UI_Servo_Refresh(void)
+{
+    OLED_Clear();
+    OLED_ShowString(1, 1, "  Servo Control ");
+    OLED_ShowString(2, 1, "SERVO Angle: ");
+    OLED_ShowNum(2, 14, Servo_Angle, 3); // 显示3位数字
+    OLED_ShowString(2, 17, "d");         // 字库可能没有°符号，用 'd' 或 'deg' 替代，显得专业
+    OLED_ShowString(4, 1, "K1:90d K2:Next");
+    OLED_ShowString(4, 13, "K3:Lock");
+}
+
+void UI_Switch_Page(Page_t new_page)
+{
+    current_page = new_page;
+    if (current_page == PAGE_LOCK) UI_Lock_Refresh();
+    else if (current_page == PAGE_LED_CTRL) UI_Led_Ctrl_Refresh();
+    else if (current_page == PAGE_SERVO) UI_Servo_Refresh();
+}
+
+// 低电平点亮逻辑
+void Apply_LED_Mode(void)
+{
+    if (Led_Mode == 0) { GPIO_ResetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
+    else if (Led_Mode == 1) { GPIO_SetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
+    else if (Led_Mode == 2) {
+        Led_Blink_Timer = millis();
+        Led_Blink_State = 1;
+        GPIO_ResetBits(LED1_PORT, LED1_PIN);
+    }
+}
+
+int main(void)
+{
+    System_TimeInit();
+    OLED_Init();
+    Key_Init();
+    My_LED_Init();
+    Servo_Init();
+    
+    // 初始化 EC11 A/B 相为输入
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU; // 上拉输入
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    
+    UI_Switch_Page(PAGE_LOCK);
+
+    while (1)
+    {
+        Key_Scan();
+
+        // ================= 界面一：密码锁 =================
+        if (current_page == PAGE_LOCK)
+        {
+            if (Lock_State == 0)
+            {
+                if (Key_GetClick(KEY_1) == 1) { Current_Num = (Current_Num + 1) % 10; UI_Lock_Refresh(); }
+                if (Key_GetClick(KEY_2) == 1) {
+                    Input_Pwd[Input_Index] = Current_Num; Input_Index++; Current_Num = 0;
+                    if (Input_Index >= PWD_LEN) {
+                        uint8_t is_correct = 1;
+                        for (uint8_t i = 0; i < PWD_LEN; i++) { if (Input_Pwd[i] != Master_Pwd[i]) { is_correct = 0; break; } }
+                        if (is_correct) {
+                            Lock_State = 1; Led_Mode = 0; Apply_LED_Mode();
+                            UI_Switch_Page(PAGE_LED_CTRL);
+                        } else {
+                            OLED_Clear(); OLED_ShowString(1, 1, "Password Error!");
+                            Delay_ms(1000); Input_Index = 0; Current_Num = 0; UI_Lock_Refresh();
+                        }
+                    } else UI_Lock_Refresh();
+                }
+                if (Key_GetClick(KEY_3) == 1) { if (Input_Index > 0) { Input_Index--; Current_Num = 0; UI_Lock_Refresh(); } }
+            }
+        }
+        
+        // ================= 界面二：LED控制 =================
+        else if (current_page == PAGE_LED_CTRL)
+        {
+            if (Key_GetClick(KEY_1) == 1) { Led_Mode = (Led_Mode + 1) % 3; Apply_LED_Mode(); UI_Led_Ctrl_Refresh(); }
+            if (Key_GetClick(KEY_2) == 1) { UI_Switch_Page(PAGE_SERVO); } // 进入界面三
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0;
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN); UI_Switch_Page(PAGE_LOCK);
+            }
+            if (Led_Mode == 2) {
+                if ((uint32_t)(millis() - Led_Blink_Timer) >= 500) {
+                    Led_Blink_Timer = millis(); Led_Blink_State = !Led_Blink_State;
+                    if (Led_Blink_State) GPIO_ResetBits(LED1_PORT, LED1_PIN);
+                    else GPIO_SetBits(LED1_PORT, LED1_PIN);
+                }
+            }
+        }
+
+        // ================= 界面三：舵机控制 =================
+        else if (current_page == PAGE_SERVO)
+        {
+            // 1. 处理 EC11 旋转
+            int8_t enc_val = Encoder_Scan();
+            if (enc_val == 1) {
+                Servo_SetAngle(Servo_Angle + 1); // 顺时针，+1度
+                UI_Servo_Refresh();
+            } else if (enc_val == -1) {
+                Servo_SetAngle(Servo_Angle - 1); // 逆时针，-1度
+                UI_Servo_Refresh();
+            }
+
+            // 2. 处理按键
+            if (Key_GetClick(KEY_1) == 1) {
+                Servo_SetAngle(90); // K1 回中
+                UI_Servo_Refresh();
+            }
+            if (Key_GetClick(KEY_2) == 1) {
+                // TODO: 进入界面四，目前预留
+                OLED_ShowString(3, 1, "Next Page Ready...");
+            }
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0;
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN);
+                UI_Switch_Page(PAGE_LOCK);
+            }
+        }
+
+        // ================= 全局系统运行指示灯 (PA2) =================
+        static uint32_t sys_tick = 0;
+        if ((uint32_t)(millis() - sys_tick) >= 500) {
+            sys_tick = millis();
+            GPIOA->ODR ^= LED2_PIN; 
+        }
+    }
+}
