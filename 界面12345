@@ -1,0 +1,510 @@
+#include "stm32f10x.h"
+#include "system.h"
+#include "OLED.h"
+#include "Key.h"
+#include "Delay.h"
+#include "Serial.h"
+#include "Motor.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// ================= 引脚宏定义 =================
+#define LED1_PORT GPIOB
+#define LED1_PIN  GPIO_Pin_12
+#define LED2_PORT GPIOB
+#define LED2_PIN  GPIO_Pin_13
+
+// ================= 页面状态定义 =================
+typedef enum {
+    PAGE_LOCK = 0, PAGE_LED_CTRL = 1, PAGE_SERVO = 2, PAGE_UART = 3, PAGE_MOTOR = 4
+} Page_t;
+Page_t current_page = PAGE_LOCK;
+
+// ================= 密码锁参数 =================
+#define PWD_LEN 5
+uint8_t Master_Pwd[PWD_LEN] = {1, 2, 3, 4, 5};
+uint8_t Input_Pwd[PWD_LEN] = {0};
+uint8_t Input_Index = 0;
+uint8_t Current_Num = 0;
+uint8_t Lock_State = 0;
+
+// ================= 界面二：LED控制 =================
+uint8_t Led_Mode = 0;          
+uint32_t Led_Blink_Timer = 0;  
+uint8_t Led_Blink_State = 0;   
+
+// ================= 界面三：舵机控制 =================
+uint16_t Servo_Angle = 90;     
+
+// ================= 界面四：UART =================
+char Uart_RxBuffer[100] = {0};
+uint8_t Uart_RxIndex = 0;
+uint8_t Uart_RxComplete = 0;
+char Uart_Msg[30] = "";
+uint32_t Uart_Popup_Timer = 0;
+uint8_t Uart_Popup_Flag = 0;
+
+// ================= 界面五：电机控制 =================
+int16_t Target_Duty = 0;
+int16_t Actual_RPM = 0;
+uint8_t Motor_Run_Flag = 0;
+uint8_t Motor_SubPage = 0; // 0: 开环, 1: 速度环, 2: 位置环, 3: 串级
+
+// ================= 函数声明 =================
+void My_LED_Init(void);
+void Servo_Init(void);
+void Servo_SetAngle(uint16_t Angle);
+void EC11_Init(void);
+int8_t Encoder_Scan(void);
+void UI_Switch_Page(Page_t new_page);
+void UI_Lock_Refresh(void);
+void UI_Led_Ctrl_Refresh(void);
+void UI_Servo_Refresh(void);
+void UI_Uart_Refresh(void);
+void UI_Motor_Refresh(void);
+void Apply_LED_Mode(void);
+void UART_Process(void);
+
+// ================= 初始化函数 =================
+void My_LED_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Pin = LED1_PIN | LED2_PIN;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+    GPIO_SetBits(GPIOB, LED1_PIN | LED2_PIN);
+}
+
+void Servo_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_TIM1, ENABLE);
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+    
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+    TIM_OCInitTypeDef TIM_OCInitStructure;
+    TIM_TimeBaseStructure.TIM_Period = 20000 - 1;
+    TIM_TimeBaseStructure.TIM_Prescaler = 72 - 1;
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
+    
+    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
+    TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
+    TIM_OCInitStructure.TIM_Pulse = 1500;
+    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
+    TIM_OC1Init(TIM1, &TIM_OCInitStructure);
+    TIM_CtrlPWMOutputs(TIM1, ENABLE);
+    TIM_Cmd(TIM1, ENABLE);
+}
+
+void Servo_SetAngle(uint16_t Angle)
+{
+    if (Angle > 180) Angle = 180;
+    Servo_Angle = Angle;
+    uint16_t Pulse = 500 + (Angle * 2000) / 180;
+    TIM_SetCompare1(TIM1, Pulse);
+}
+
+void EC11_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+}
+
+int8_t Encoder_Scan(void)
+{
+    static uint8_t last_state = 0;
+    uint8_t current_state = 0;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;
+    
+    if (current_state != last_state)
+    {
+        Delay_us(100);
+        current_state = 0;
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;
+        if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;
+        
+        if (current_state != last_state)
+        {
+            if (last_state == 0x00 && current_state == 0x01) { last_state = current_state; return -1; }
+            else if (last_state == 0x00 && current_state == 0x02) { last_state = current_state; return 1; }
+            else if (last_state == 0x01 && current_state == 0x00) { last_state = current_state; return 1; }
+            else if (last_state == 0x02 && current_state == 0x00) { last_state = current_state; return -1; }
+            else last_state = current_state;
+        }
+    }
+    return 0;
+}
+
+// ================= 界面刷新函数 =================
+void UI_Lock_Refresh(void)
+{
+    OLED_Clear();
+    if (Lock_State == 0) 
+    {
+        OLED_ShowString(1, 1, "PASSWORD");
+        OLED_ShowString(2, 1, "Input: ");
+        for (uint8_t i = 0; i < PWD_LEN; i++) {
+            if (i == Input_Index) OLED_ShowNum(2, 8 + i, Current_Num, 1);
+            else OLED_ShowNum(2, 8 + i, Input_Pwd[i], 1);
+        }
+        OLED_ShowString(4, 1, "K1:Pos K2:Num K3:OK");
+    }
+}
+
+void UI_Led_Ctrl_Refresh(void)
+{
+    OLED_Clear();
+    OLED_ShowString(1, 1, "  LED Control  ");
+    OLED_ShowString(2, 1, "Mode: ");
+    if (Led_Mode == 0) OLED_ShowString(2, 7, "1 - Always ON ");
+    else if (Led_Mode == 1) OLED_ShowString(2, 7, "2 - Always OFF");
+    else if (Led_Mode == 2) OLED_ShowString(2, 7, "3 - Blinking  ");
+    OLED_ShowString(4, 1, "K1:Mode K2:Next K3:Lock");
+}
+
+void UI_Servo_Refresh(void)
+{
+    OLED_Clear();
+    OLED_ShowString(1, 1, "  Servo Control ");
+    OLED_ShowString(2, 1, "Angle: ");
+    OLED_ShowNum(2, 8, Servo_Angle, 3);
+    OLED_ShowString(2, 11, "d");
+    OLED_ShowString(4, 1, "K1:90d K2:Next K3:Lock");
+}
+
+void UI_Uart_Refresh(void)
+{
+    OLED_Clear();
+    OLED_ShowString(1, 1, "  System / UART  ");
+    if (Uart_Popup_Flag == 1) {
+        OLED_ShowString(2, 1, "Msg: ");
+        OLED_ShowString(2, 6, Uart_Msg);
+    } else {
+        OLED_ShowString(2, 1, "UART");
+    }
+    OLED_ShowString(4, 1, "K1:Send K2:Next K3:Lock");
+}
+
+void UI_Motor_Refresh(void)
+{
+    OLED_Clear();
+    if (Motor_SubPage == 0) // 开环
+    {
+        OLED_ShowString(1, 1, "  MOTOR OPEN  ");
+        OLED_ShowString(2, 1, "Duty: ");
+        OLED_ShowSignedNum(2, 7, Target_Duty, 3);
+        OLED_ShowString(2, 10, "%");
+        OLED_ShowString(3, 1, "RPM : ");
+        OLED_ShowSignedNum(3, 7, Actual_RPM, 4);
+    }
+    else if (Motor_SubPage == 1) // 速度环
+    {
+        OLED_ShowString(1, 1, "  SPEED PID  ");
+        OLED_ShowString(2, 1, "Set: ");
+        OLED_ShowNum(2, 6, (uint32_t)Target_RPM, 4);
+        OLED_ShowString(3, 1, "Now: ");
+        OLED_ShowNum(3, 6, (uint32_t)Actual_RPM, 4);
+        OLED_ShowString(4, 1, "Out: ");
+        OLED_ShowSignedNum(4, 6, PID_Out, 3);
+    }
+    else if (Motor_SubPage == 2) // 位置环（占位，未实现）
+    {
+        OLED_ShowString(1, 1, "  POS PID  ");
+        OLED_ShowString(2, 1, "Tgt: 0");
+        OLED_ShowString(3, 1, "Act: 0");
+        OLED_ShowString(4, 1, "Out: 0");
+    }
+    else if (Motor_SubPage == 3) // 串级（占位，未实现）
+    {
+        OLED_ShowString(1, 1, " CASCADE PID ");
+        OLED_ShowString(2, 1, "TgtPos: 0");
+        OLED_ShowString(3, 1, "ActPos: 0");
+        OLED_ShowString(4, 1, "TgtRPM: 0");
+    }
+    OLED_ShowString(4, 13, "K2:Next");
+}
+
+void UI_Switch_Page(Page_t new_page)
+{
+    current_page = new_page;
+    if (current_page == PAGE_LOCK) UI_Lock_Refresh();
+    else if (current_page == PAGE_LED_CTRL) UI_Led_Ctrl_Refresh();
+    else if (current_page == PAGE_SERVO) UI_Servo_Refresh();
+    else if (current_page == PAGE_UART) UI_Uart_Refresh();
+    else if (current_page == PAGE_MOTOR) UI_Motor_Refresh();
+}
+
+void Apply_LED_Mode(void)
+{
+    if (Led_Mode == 0) { GPIO_ResetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
+    else if (Led_Mode == 1) { GPIO_SetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
+    else if (Led_Mode == 2) { Led_Blink_Timer = millis(); Led_Blink_State = 1; GPIO_ResetBits(LED1_PORT, LED1_PIN); }
+}
+
+// ================= UART 指令解析 =================
+void UART_Process(void)
+{
+    if (Serial_GetRxFlag() == 1)
+    {
+        char ch = Serial_GetRxData();
+        if (ch == '[') { Uart_RxIndex = 0; Uart_RxBuffer[Uart_RxIndex++] = ch; }
+        else if (ch == ']') { Uart_RxBuffer[Uart_RxIndex++] = ch; Uart_RxBuffer[Uart_RxIndex] = '\0'; Uart_RxComplete = 1; }
+        else if (Uart_RxIndex > 0 && Uart_RxIndex < 99) { Uart_RxBuffer[Uart_RxIndex++] = ch; }
+        else { Uart_RxIndex = 0; }
+    }
+
+    if (Uart_RxComplete == 1)
+    {
+        uint8_t is_ok = 1;
+        char popup[30] = "";
+        
+        if (strcmp(Uart_RxBuffer, "[1]") == 0) { Led_Mode = 0; Apply_LED_Mode(); strcpy(popup, "LED ON"); }
+        else if (strcmp(Uart_RxBuffer, "[2]") == 0) { Led_Mode = 1; Apply_LED_Mode(); strcpy(popup, "LED OFF"); }
+        else if (strcmp(Uart_RxBuffer, "[3]") == 0) { Led_Mode = 2; Apply_LED_Mode(); strcpy(popup, "LED Blink"); }
+        else if (strcmp(Uart_RxBuffer, "[4]") == 0) { Servo_SetAngle(0); strcpy(popup, "Servo 0"); }
+        else if (strcmp(Uart_RxBuffer, "[5]") == 0) { Servo_SetAngle(90); strcpy(popup, "Servo 90"); }
+        else if (strcmp(Uart_RxBuffer, "[6]") == 0) { Servo_SetAngle(180); strcpy(popup, "Servo 180"); }
+        else if (strncmp(Uart_RxBuffer, "[7:", 3) == 0) 
+        {
+            int angle = atoi(&Uart_RxBuffer[3]);
+            if (angle >= 0 && angle <= 180) { Servo_SetAngle(angle); sprintf(popup, "Servo %d", angle); }
+            else is_ok = 0;
+        }
+        else if (strncmp(Uart_RxBuffer, "[P:", 3) == 0)
+        {
+            int old_pwd = atoi(&Uart_RxBuffer[3]);
+            char *p = strchr(&Uart_RxBuffer[3], ':');
+            if (p != NULL)
+            {
+                int new_pwd = atoi(p + 1);
+                int expected_old = Master_Pwd[0]*10000 + Master_Pwd[1]*1000 + Master_Pwd[2]*100 + Master_Pwd[3]*10 + Master_Pwd[4];
+                if (old_pwd == expected_old && new_pwd >= 0 && new_pwd <= 99999)
+                {
+                    Master_Pwd[0] = new_pwd / 10000 % 10; Master_Pwd[1] = new_pwd / 1000 % 10;
+                    Master_Pwd[2] = new_pwd / 100 % 10; Master_Pwd[3] = new_pwd / 10 % 10;
+                    Master_Pwd[4] = new_pwd % 10;
+                    strcpy(popup, "PWD Changed");
+                } else is_ok = 0;
+            } else is_ok = 0;
+        }
+        else is_ok = 0;
+
+        if (is_ok) Serial_SendString("OK\r\n");
+        else { Serial_SendString("ERROR\r\n"); strcpy(popup, "ERROR"); }
+
+        Uart_Popup_Flag = 1; Uart_Popup_Timer = millis(); strcpy(Uart_Msg, popup);
+        if (current_page == PAGE_UART) UI_Uart_Refresh(); 
+        Uart_RxComplete = 0; Uart_RxIndex = 0;
+    }
+}
+
+// ================= 主函数 =================
+int main(void)
+{
+    System_TimeInit();
+    OLED_Init();
+    Key_Init();
+    My_LED_Init();
+    Servo_Init();
+    EC11_Init();
+    Serial_Init();
+    Motor_Init();
+    
+    UI_Switch_Page(PAGE_LOCK);
+
+    while (1)
+    {
+        Key_Scan();
+        UART_Process();
+        
+        if (Uart_Popup_Flag == 1) {
+            if ((uint32_t)(millis() - Uart_Popup_Timer) >= 2000) {
+                Uart_Popup_Flag = 0;
+                if (current_page == PAGE_UART) UI_Uart_Refresh();
+            }
+        }
+
+        // ================= 界面一：密码锁 =================
+        if (current_page == PAGE_LOCK)
+        {
+            if (Lock_State == 0)
+            {
+                if (Key_GetClick(KEY_1) == 1) { 
+                    Input_Pwd[Input_Index] = Current_Num; Input_Index++; 
+                    if(Input_Index >= PWD_LEN) Input_Index = 0; Current_Num = 0; UI_Lock_Refresh(); 
+                }
+                if (Key_GetClick(KEY_2) == 1) { Current_Num = (Current_Num + 1) % 10; UI_Lock_Refresh(); }
+                if (Key_GetClick(KEY_3) == 1) {
+                    Input_Pwd[Input_Index] = Current_Num;
+                    uint8_t is_correct = 1;
+                    for (uint8_t i = 0; i < PWD_LEN; i++) { if (Input_Pwd[i] != Master_Pwd[i]) { is_correct = 0; break; } }
+                    if (is_correct) {
+                        Lock_State = 1; Led_Mode = 0; Apply_LED_Mode(); UI_Switch_Page(PAGE_LED_CTRL);
+                    } else {
+                        OLED_Clear(); OLED_ShowString(1, 1, "  ERROR!  ");
+                        Delay_ms(2000); 
+                        Input_Index = 0; Current_Num = 0; 
+                        for(uint8_t i=0;i<PWD_LEN;i++) Input_Pwd[i]=0; UI_Lock_Refresh();
+                    }
+                }
+            }
+        }
+        
+        // ================= 界面二：LED控制 =================
+        else if (current_page == PAGE_LED_CTRL)
+        {
+            if (Key_GetClick(KEY_1) == 1) { Led_Mode = (Led_Mode + 1) % 3; Apply_LED_Mode(); UI_Led_Ctrl_Refresh(); }
+            if (Key_GetClick(KEY_2) == 1) { UI_Switch_Page(PAGE_SERVO); }
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0; 
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN); UI_Switch_Page(PAGE_LOCK);
+            }
+            if (Led_Mode == 2) {
+                if ((uint32_t)(millis() - Led_Blink_Timer) >= 500) {
+                    Led_Blink_Timer = millis(); Led_Blink_State = !Led_Blink_State;
+                    if (Led_Blink_State) GPIO_ResetBits(LED1_PORT, LED1_PIN);
+                    else GPIO_SetBits(LED1_PORT, LED1_PIN);
+                }
+            }
+        }
+
+        // ================= 界面三：舵机控制 =================
+        else if (current_page == PAGE_SERVO)
+        {
+            int8_t enc_val = Encoder_Scan();
+            if (enc_val == 1) { Servo_SetAngle(Servo_Angle + 1); UI_Servo_Refresh(); }
+            else if (enc_val == -1) { Servo_SetAngle(Servo_Angle - 1); UI_Servo_Refresh(); }
+
+            if (Key_GetClick(KEY_1) == 1) { Servo_SetAngle(90); UI_Servo_Refresh(); }
+            if (Key_GetClick(KEY_2) == 1) { UI_Switch_Page(PAGE_UART); }
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0; 
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN); UI_Switch_Page(PAGE_LOCK);
+            }
+        }
+
+        // ================= 界面四：系统 / UART =================
+        else if (current_page == PAGE_UART)
+        {
+            if (Key_GetClick(KEY_1) == 1) {
+                Serial_SendString("[Hello Robot]\r\n");
+                Uart_Popup_Flag = 1; Uart_Popup_Timer = millis(); strcpy(Uart_Msg, "Sent Hello"); UI_Uart_Refresh();
+            }
+            if (Key_GetClick(KEY_2) == 1) { UI_Switch_Page(PAGE_MOTOR); }
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0; 
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN); UI_Switch_Page(PAGE_LOCK);
+            }
+        }
+
+        // ================= 界面五：电机控制 =================
+        else if (current_page == PAGE_MOTOR)
+        {
+            int8_t enc_val = Encoder_Scan();
+            
+            if (Motor_SubPage == 0) // 开环
+            {
+                if (enc_val == 1) { Target_Duty += 5; if(Target_Duty > 100) Target_Duty = 100; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
+                else if (enc_val == -1) { Target_Duty -= 5; if(Target_Duty < 0) Target_Duty = 0; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
+            }
+            else if (Motor_SubPage == 1) // 速度环
+            {
+                if (enc_val == 1) { Target_RPM += 10; UI_Motor_Refresh(); }
+                else if (enc_val == -1) { Target_RPM -= 10; if(Target_RPM < 0) Target_RPM = 0; UI_Motor_Refresh(); }
+            }
+
+            // K1：启动/停止
+            if (Key_GetClick(KEY_1) == 1) {
+                Motor_Run_Flag = !Motor_Run_Flag;
+                if (!Motor_Run_Flag) {
+                    Motor_SetPWM(0);
+                    Integral = 0; Prev_Error = 0;
+                }
+                UI_Motor_Refresh();
+            }
+
+            // K2：短按和长按
+            if (Key_GetLongPress(KEY_2) == 1)
+            {
+                if (Motor_SubPage == 0) { Motor_SubPage = 1; Target_RPM = 100; }
+                else { Motor_SubPage = 0; Motor_SetPWM(0); Motor_Run_Flag = 0; Integral = 0; }
+                UI_Motor_Refresh();
+            }
+            else if (Key_GetClick(KEY_2) == 1)
+            {
+                if (Motor_SubPage == 0) { 
+                    Motor_SetPWM(0); Motor_Run_Flag = 0;
+                    UI_Switch_Page(PAGE_LED_CTRL); 
+                } else {
+                    Motor_SubPage++;
+                    if (Motor_SubPage > 3) Motor_SubPage = 1;
+                    Motor_SetPWM(0); Integral = 0;
+                    UI_Motor_Refresh();
+                }
+            }
+
+            // K3：返回密码锁
+            if (Key_GetClick(KEY_3) == 1) {
+                Lock_State = 0; Input_Index = 0; Current_Num = 0; 
+                for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
+                GPIO_SetBits(LED1_PORT, LED1_PIN); 
+                Motor_SetPWM(0); Motor_Run_Flag = 0; Integral = 0;
+                Motor_SubPage = 0;
+                UI_Switch_Page(PAGE_LOCK);
+            }
+
+            // 1. 5ms PID 计算周期
+            static uint32_t pid_tick = 0;
+            if ((uint32_t)(millis() - pid_tick) >= 5) 
+            {
+                pid_tick = millis();
+                Actual_RPM = Motor_GetRPM();
+                
+                if (Motor_SubPage == 1 && Motor_Run_Flag == 1)
+                {
+                    PID_Out = Speed_PID_Calc((int16_t)Target_RPM, Actual_RPM);
+                    Motor_SetPWM(PID_Out);
+                }
+            }
+
+            // 2. 50ms OLED 刷新周期（防闪烁）
+            static uint32_t ui_tick = 0;
+            if ((uint32_t)(millis() - ui_tick) >= 50) 
+            {
+                ui_tick = millis();
+                UI_Motor_Refresh();
+            }
+
+            // 3. 20ms VOFA+ 串口发送周期
+            static uint32_t vofa_tick = 0;
+            if ((uint32_t)(millis() - vofa_tick) >= 20) 
+            {
+                vofa_tick = millis();
+                printf("%d,%d,%d,%.1f\r\n", (int)Target_RPM, (int)Actual_RPM, PID_Out, (Target_RPM - Actual_RPM));
+            }
+        }
+
+        // 系统运行指示灯
+        static uint32_t sys_tick = 0;
+        if ((uint32_t)(millis() - sys_tick) >= 500) {
+            sys_tick = millis();
+            GPIOB->ODR ^= LED2_PIN; 
+        }
+    }
+}
