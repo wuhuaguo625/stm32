@@ -90,26 +90,26 @@ void Servo_Init(void)
     
     TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
     TIM_OCInitTypeDef TIM_OCInitStructure;
-    TIM_TimeBaseStructure.TIM_Period = 20000 - 1;
-    TIM_TimeBaseStructure.TIM_Prescaler = 72 - 1;
+    TIM_TimeBaseStructure.TIM_Period = 20000 - 1; // 周期：20ms 循环一次
+    TIM_TimeBaseStructure.TIM_Prescaler = 72 - 1; // 减速齿轮：72MHz → 1MHz，每 1us 计一次数
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
-    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;//设置计数模式为向上计数
     TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
     
-    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
+    TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;// PWM 模式1：计数值小于Pulse时输出高电平
     TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
-    TIM_OCInitStructure.TIM_Pulse = 1500;
-    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
-    TIM_OC1Init(TIM1, &TIM_OCInitStructure);
-    TIM_CtrlPWMOutputs(TIM1, ENABLE);
-    TIM_Cmd(TIM1, ENABLE);
+    TIM_OCInitStructure.TIM_Pulse = 1500; // 初始 1.5ms 高电平 → 90°
+    TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High; // 高电平有效
+    TIM_OC1Init(TIM1, &TIM_OCInitStructure);  
+    TIM_CtrlPWMOutputs(TIM1, ENABLE);// TIM1是高级定时器，必须单独开PWM输出
+    TIM_Cmd(TIM1, ENABLE);  // 启动定时器，开始循环
 }
 
 void Servo_SetAngle(uint16_t Angle)
 {
     if (Angle > 180) Angle = 180;
     Servo_Angle = Angle;
-    uint16_t Pulse = 500 + (Angle * 2000) / 180;
+    uint16_t Pulse = 500 + (Angle * 2000) / 180;//舵机没有“记忆”，每次收到脉宽，就转到对应的绝对角度
     TIM_SetCompare1(TIM1, Pulse);
 }
 
@@ -126,10 +126,10 @@ void EC11_Init(void)
 
 int8_t Encoder_Scan(void)
 {
-    static uint8_t last_state = 0;
+    static uint8_t last_state = 0;// 上一次的状态（静态变量，函数结束后不销毁）
     uint8_t current_state = 0;
-    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;
-    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_6) == 1) current_state |= 0x01;//A
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_7) == 1) current_state |= 0x02;//B
     
     if (current_state != last_state)
     {
@@ -140,10 +140,10 @@ int8_t Encoder_Scan(void)
         
         if (current_state != last_state)
         {
-            if (last_state == 0x00 && current_state == 0x01) { last_state = current_state; return -1; }
-            else if (last_state == 0x00 && current_state == 0x02) { last_state = current_state; return 1; }
-            else if (last_state == 0x01 && current_state == 0x00) { last_state = current_state; return 1; }
-            else if (last_state == 0x02 && current_state == 0x00) { last_state = current_state; return -1; }
+            if (last_state == 0x00 && current_state == 0x01) { last_state = current_state; return -1; }//A先变1逆时针
+            else if (last_state == 0x00 && current_state == 0x02) { last_state = current_state; return 1; }//B先变1顺时针
+            else if (last_state == 0x01 && current_state == 0x00) { last_state = current_state; return 1; }//A先回0顺时针
+            else if (last_state == 0x02 && current_state == 0x00) { last_state = current_state; return -1; }//B先回0逆时针
             else last_state = current_state;
         }
     }
@@ -224,7 +224,7 @@ void UI_Switch_Page(Page_t new_page)
 
 void Apply_LED_Mode(void)
 {
-    if (Led_Mode == 0) { GPIO_ResetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
+    if (Led_Mode == 0) { GPIO_ResetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }//把闪烁状态清零，防止闪烁逻辑残留影响常亮模式
     else if (Led_Mode == 1) { GPIO_SetBits(LED1_PORT, LED1_PIN); Led_Blink_State = 0; }
     else if (Led_Mode == 2) { Led_Blink_Timer = millis(); Led_Blink_State = 1; GPIO_ResetBits(LED1_PORT, LED1_PIN); }
 }
@@ -246,22 +246,22 @@ void UART_Process(void)
         uint8_t is_ok = 1;
         char popup[30] = "";
         
-        if (strcmp(Uart_RxBuffer, "[1]") == 0) { Led_Mode = 0; Apply_LED_Mode(); strcpy(popup, "LED ON"); }
-        else if (strcmp(Uart_RxBuffer, "[2]") == 0) { Led_Mode = 1; Apply_LED_Mode(); strcpy(popup, "LED OFF"); }
+        if (strcmp(Uart_RxBuffer, "[1]") == 0) { Led_Mode = 0; Apply_LED_Mode(); strcpy(popup, "LED ON"); }//strcpy把字符串拷贝到另一个数组
+        else if (strcmp(Uart_RxBuffer, "[2]") == 0) { Led_Mode = 1; Apply_LED_Mode(); strcpy(popup, "LED OFF"); }//strcmp，比较两个字符串是否完全相同
         else if (strcmp(Uart_RxBuffer, "[3]") == 0) { Led_Mode = 2; Apply_LED_Mode(); strcpy(popup, "LED Blink"); }
         else if (strcmp(Uart_RxBuffer, "[4]") == 0) { Servo_SetAngle(0); strcpy(popup, "Servo 0"); }
         else if (strcmp(Uart_RxBuffer, "[5]") == 0) { Servo_SetAngle(90); strcpy(popup, "Servo 90"); }
         else if (strcmp(Uart_RxBuffer, "[6]") == 0) { Servo_SetAngle(180); strcpy(popup, "Servo 180"); }
-        else if (strncmp(Uart_RxBuffer, "[7:", 3) == 0) 
+        else if (strncmp(Uart_RxBuffer, "[7:", 3) == 0) //strncmp只比较前 n 个字符
         {
-            int angle = atoi(&Uart_RxBuffer[3]);
-            if (angle >= 0 && angle <= 180) { Servo_SetAngle(angle); sprintf(popup, "Servo %d", angle); }
+            int angle = atoi(&Uart_RxBuffer[3]);//atoi字符串转整数， 会从字符串开头一直读数字，遇到非数字字符就停
+            if (angle >= 0 && angle <= 180) { Servo_SetAngle(angle); sprintf(popup, "Servo %d", angle); }//可以把两个拼起来传入数组
             else is_ok = 0;
         }
         else if (strncmp(Uart_RxBuffer, "[P:", 3) == 0)
         {
             int old_pwd = atoi(&Uart_RxBuffer[3]);
-            char *p = strchr(&Uart_RxBuffer[3], ':');
+            char *p = strchr(&Uart_RxBuffer[3], ':');//strchr查找字符在字符串中第一次出现的位置
             if (p != NULL)
             {
                 int new_pwd = atoi(p + 1);
@@ -303,7 +303,6 @@ int main(void)
     while (1)
     {
         Key_Scan();
-        UART_Process();
         
         if (Uart_Popup_Flag == 1) {
             if ((uint32_t)(millis() - Uart_Popup_Timer) >= 2000) {
@@ -375,7 +374,8 @@ int main(void)
 
         // ================= 界面四：系统 / UART =================
         else if (current_page == PAGE_UART)
-        {
+        {   
+            UART_Process()；
             if (Key_GetClick(KEY_1) == 1) {
                 Serial_SendString("[Hello Robot]\r\n");
                 Uart_Popup_Flag = 1; Uart_Popup_Timer = millis(); strcpy(Uart_Msg, "Sent Hello"); UI_Uart_Refresh();
@@ -425,7 +425,7 @@ int main(void)
         static uint32_t sys_tick = 0;
         if ((uint32_t)(millis() - sys_tick) >= 500) {
             sys_tick = millis();
-            GPIOB->ODR ^= LED2_PIN; 
+            GPIOB->ODR ^= LED2_PIN; //GPIOB->ODR ^= GPIO_Pin_13 就是把 PB13 的输出位翻转一次
         }
     }
 }
