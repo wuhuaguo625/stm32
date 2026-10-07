@@ -4,7 +4,7 @@
 #include "Key.h"
 #include "Delay.h"
 #include "Serial.h"
-#include "Motor.h"
+#include "Motor.h"    // 引入你现有 Motor.c 的头文件
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -45,11 +45,10 @@ char Uart_Msg[30] = "";
 uint32_t Uart_Popup_Timer = 0;
 uint8_t Uart_Popup_Flag = 0;
 
-// ================= 界面五：电机控制 =================
+// ================= 界面五：电机开环 =================
 int16_t Target_Duty = 0;
 int16_t Actual_RPM = 0;
 uint8_t Motor_Run_Flag = 0;
-uint8_t Motor_SubPage = 0; // 0: 开环, 1: 速度环, 2: 位置环, 3: 串级
 
 // ================= 函数声明 =================
 void My_LED_Init(void);
@@ -66,7 +65,9 @@ void UI_Motor_Refresh(void);
 void Apply_LED_Mode(void);
 void UART_Process(void);
 
-// ================= 初始化函数 =================
+// ================= 以下三个初始化只在本文件里定义 =================
+
+// 1. LED初始化
 void My_LED_Init(void)
 {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
@@ -78,6 +79,7 @@ void My_LED_Init(void)
     GPIO_SetBits(GPIOB, LED1_PIN | LED2_PIN);
 }
 
+// 2. 舵机初始化 (PA8 - TIM1_CH1)
 void Servo_Init(void)
 {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_TIM1, ENABLE);
@@ -112,6 +114,7 @@ void Servo_SetAngle(uint16_t Angle)
     TIM_SetCompare1(TIM1, Pulse);
 }
 
+// 3. EC11 旋钮初始化 (PA6, PA7)
 void EC11_Init(void)
 {
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
@@ -201,40 +204,13 @@ void UI_Uart_Refresh(void)
 void UI_Motor_Refresh(void)
 {
     OLED_Clear();
-    if (Motor_SubPage == 0) // 开环
-    {
-        OLED_ShowString(1, 1, "  MOTOR OPEN  ");
-        OLED_ShowString(2, 1, "Duty: ");
-        OLED_ShowSignedNum(2, 7, Target_Duty, 3);
-        OLED_ShowString(2, 10, "%");
-        OLED_ShowString(3, 1, "RPM : ");
-        OLED_ShowSignedNum(3, 7, Actual_RPM, 4);
-    }
-    else if (Motor_SubPage == 1) // 速度环
-    {
-        OLED_ShowString(1, 1, "  SPEED PID  ");
-        OLED_ShowString(2, 1, "Set: ");
-        OLED_ShowNum(2, 6, (uint32_t)Target_RPM, 4);
-        OLED_ShowString(3, 1, "Now: ");
-        OLED_ShowNum(3, 6, (uint32_t)Actual_RPM, 4);
-        OLED_ShowString(4, 1, "Out: ");
-        OLED_ShowSignedNum(4, 6, PID_Out, 3);
-    }
-    else if (Motor_SubPage == 2) // 位置环（占位，未实现）
-    {
-        OLED_ShowString(1, 1, "  POS PID  ");
-        OLED_ShowString(2, 1, "Tgt: 0");
-        OLED_ShowString(3, 1, "Act: 0");
-        OLED_ShowString(4, 1, "Out: 0");
-    }
-    else if (Motor_SubPage == 3) // 串级（占位，未实现）
-    {
-        OLED_ShowString(1, 1, " CASCADE PID ");
-        OLED_ShowString(2, 1, "TgtPos: 0");
-        OLED_ShowString(3, 1, "ActPos: 0");
-        OLED_ShowString(4, 1, "TgtRPM: 0");
-    }
-    OLED_ShowString(4, 13, "K2:Next");
+    OLED_ShowString(1, 1, "  MOTOR OPEN  ");
+    OLED_ShowString(2, 1, "Duty: ");
+    OLED_ShowSignedNum(2, 7, Target_Duty, 3);
+    OLED_ShowString(2, 10, "%");
+    OLED_ShowString(3, 1, "RPM : ");
+    OLED_ShowSignedNum(3, 7, Actual_RPM, 4);
+    OLED_ShowString(4, 1, "K1:Run K2:Next K3:Lock");
 }
 
 void UI_Switch_Page(Page_t new_page)
@@ -319,9 +295,9 @@ int main(void)
     Key_Init();
     My_LED_Init();
     Servo_Init();
-    EC11_Init();
+    EC11_Init();      // 用 EC11_Init（不与 Motor.c 的 Encoder_Init 冲突）
     Serial_Init();
-    Motor_Init();
+    Motor_Init();     // 来自 Motor.c
     
     UI_Switch_Page(PAGE_LOCK);
 
@@ -413,90 +389,36 @@ int main(void)
             }
         }
 
-        // ================= 界面五：电机控制 =================
+        // ================= 界面五：电机开环 =================
         else if (current_page == PAGE_MOTOR)
         {
             int8_t enc_val = Encoder_Scan();
-            
-            if (Motor_SubPage == 0) // 开环
-            {
-                if (enc_val == 1) { Target_Duty += 5; if(Target_Duty > 100) Target_Duty = 100; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
-                else if (enc_val == -1) { Target_Duty -= 5; if(Target_Duty < 0) Target_Duty = 0; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
-            }
-            else if (Motor_SubPage == 1) // 速度环
-            {
-                if (enc_val == 1) { Target_RPM += 10; UI_Motor_Refresh(); }
-                else if (enc_val == -1) { Target_RPM -= 10; if(Target_RPM < 0) Target_RPM = 0; UI_Motor_Refresh(); }
-            }
+            if (enc_val == 1) { Target_Duty += 5; if(Target_Duty > 100) Target_Duty = 100; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
+            else if (enc_val == -1) { Target_Duty -= 5; if(Target_Duty < 0) Target_Duty = 0; Motor_SetPWM(Target_Duty); UI_Motor_Refresh(); }
 
-            // K1：启动/停止
             if (Key_GetClick(KEY_1) == 1) {
                 Motor_Run_Flag = !Motor_Run_Flag;
-                if (!Motor_Run_Flag) {
-                    Motor_SetPWM(0);
-                    Integral = 0; Prev_Error = 0;
-                }
+                if (!Motor_Run_Flag) Motor_SetPWM(0);
+                else Motor_SetPWM(Target_Duty);
                 UI_Motor_Refresh();
             }
-
-            // K2：短按和长按
-            if (Key_GetLongPress(KEY_2) == 1)
-            {
-                if (Motor_SubPage == 0) { Motor_SubPage = 1; Target_RPM = 100; }
-                else { Motor_SubPage = 0; Motor_SetPWM(0); Motor_Run_Flag = 0; Integral = 0; }
-                UI_Motor_Refresh();
+            if (Key_GetClick(KEY_2) == 1) { 
+                Motor_SetPWM(0); Motor_Run_Flag = 0;
+                UI_Switch_Page(PAGE_LED_CTRL); 
             }
-            else if (Key_GetClick(KEY_2) == 1)
-            {
-                if (Motor_SubPage == 0) { 
-                    Motor_SetPWM(0); Motor_Run_Flag = 0;
-                    UI_Switch_Page(PAGE_LED_CTRL); 
-                } else {
-                    Motor_SubPage++;
-                    if (Motor_SubPage > 3) Motor_SubPage = 1;
-                    Motor_SetPWM(0); Integral = 0;
-                    UI_Motor_Refresh();
-                }
-            }
-
-            // K3：返回密码锁
             if (Key_GetClick(KEY_3) == 1) {
                 Lock_State = 0; Input_Index = 0; Current_Num = 0; 
                 for (uint8_t i = 0; i < PWD_LEN; i++) Input_Pwd[i] = 0;
                 GPIO_SetBits(LED1_PORT, LED1_PIN); 
-                Motor_SetPWM(0); Motor_Run_Flag = 0; Integral = 0;
-                Motor_SubPage = 0;
+                Motor_SetPWM(0); Motor_Run_Flag = 0;
                 UI_Switch_Page(PAGE_LOCK);
             }
 
-            // 1. 5ms PID 计算周期
-            static uint32_t pid_tick = 0;
-            if ((uint32_t)(millis() - pid_tick) >= 5) 
-            {
-                pid_tick = millis();
+            static uint32_t rpm_tick = 0;
+            if ((uint32_t)(millis() - rpm_tick) >= 100) {
+                rpm_tick = millis();
                 Actual_RPM = Motor_GetRPM();
-                
-                if (Motor_SubPage == 1 && Motor_Run_Flag == 1)
-                {
-                    PID_Out = Speed_PID_Calc((int16_t)Target_RPM, Actual_RPM);
-                    Motor_SetPWM(PID_Out);
-                }
-            }
-
-            // 2. 50ms OLED 刷新周期（防闪烁）
-            static uint32_t ui_tick = 0;
-            if ((uint32_t)(millis() - ui_tick) >= 50) 
-            {
-                ui_tick = millis();
                 UI_Motor_Refresh();
-            }
-
-            // 3. 20ms VOFA+ 串口发送周期
-            static uint32_t vofa_tick = 0;
-            if ((uint32_t)(millis() - vofa_tick) >= 20) 
-            {
-                vofa_tick = millis();
-                printf("%d,%d,%d,%.1f\r\n", (int)Target_RPM, (int)Actual_RPM, PID_Out, (Target_RPM - Actual_RPM));
             }
         }
 
