@@ -18,7 +18,7 @@
 // ================= 页面状态定义 =================
 typedef enum {
     PAGE_LOCK = 0, PAGE_LED_CTRL = 1, PAGE_SERVO = 2, PAGE_UART = 3, PAGE_MOTOR = 4
-} Page_t;
+} Page_t;//初始密码
 Page_t current_page = PAGE_LOCK;
 
 // ================= 密码锁参数 =================
@@ -78,7 +78,6 @@ void My_LED_Init(void)
     GPIO_Init(GPIOB, &GPIO_InitStructure);
     GPIO_SetBits(GPIOB, LED1_PIN | LED2_PIN);
 }
-
 // 2. 舵机初始化 (PA8 - TIM1_CH1)
 void Servo_Init(void)
 {
